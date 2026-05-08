@@ -1,3 +1,226 @@
+import os
+import csv
+import time
+import json
+import pytz
+import smtplib
+import requests
+import pandas as pd
+from pathlib import Path
+from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.application import MIMEApplication
+
+
+# -----------------------------
+# Config
+# -----------------------------
+UNIVERSE_CSV = os.getenv("UNIVERSE_CSV", "sp500_universe.csv")
+VENDOR = os.getenv("DATA_VENDOR", "finnhub").lower()
+FINNHUB_API_KEY = os.getenv("FINNHUB_API_KEY", "")
+
+# Rate-limit controls
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "25"))
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "1.2"))
+
+# Output
+OUT_DIR = Path("output")
+OUT_DIR.mkdir(exist_ok=True)
+TOP25_CSV = OUT_DIR / "top25.csv"
+TOP25_JSON = OUT_DIR / "top25.json"
+
+# Optional email via SMTP (Outlook/Hotmail)
+SMTP_HOST = os.getenv("SMTP_HOST", "smtp.office365.com")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+EMAIL_TO = os.getenv("EMAIL_TO", SMTP_USER)
+
+
+# -----------------------------
+# Universe loading
+# -----------------------------
+def normalize_symbol(sym: str, vendor: str = "finnhub") -> str:
+    """
+    Normalize symbols for the data vendor.
+    - Finnhub usually accepts BRK.B, BF.B
+    - Some vendors want BRK-B, BF-B
+    """
+    s = (sym or "").strip().upper()
+
+    if vendor in ("polygon", "alpaca", "iex") and "." in s:
+        s = s.replace(".", "-")  # BRK.B -> BRK-B
+    return s
+
+
+def load_universe(csv_path: str = UNIVERSE_CSV, vendor: str = "finnhub") -> list:
+    path = Path(csv_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Universe file not found: {path.resolve()}")
+
+    symbols = []
+    with path.open("r", newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        if "Symbol" not in (reader.fieldnames or []):
+            raise ValueError(f"CSV must have a 'Symbol' column. Found: {reader.fieldnames}")
+
+        for row in reader:
+            sym = normalize_symbol(row.get("Symbol", ""), vendor=vendor)
+            if sym:
+                symbols.append(sym)
+
+    # de-dupe preserving order
+    seen = set()
+    out = []
+    for s in symbols:
+        if s not in seen:
+            out.append(s)
+            seen.add(s)
+
+    return out
+
+
+def chunked(lst, n):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
+
+
+# -----------------------------
+# Finnhub calls (minimal)
+# -----------------------------
+def finnhub_quote(symbol: str) -> dict:
+    """
+    Minimal quote endpoint. You can replace/extend with candles, indicators, etc.
+    """
+    if not FINNHUB_API_KEY:
+        return {}
+
+    url = "https://finnhub.io/api/v1/quote"
+    try:
+        r = requests.get(url, params={"symbol": symbol, "token": FINNHUB_API_KEY}, timeout=20)
+        if r.status_code != 200:
+            return {}
+        return r.json()
+    except Exception:
+        return {}
+
+
+# -----------------------------
+# Scanner logic (placeholder)
+# Replace scan_symbol() with your full oversold/divergence/gates scoring model
+# -----------------------------
+def scan_symbol(symbol: str) -> dict | None:
+    """
+    Placeholder scoring model.
+    Return dict with at least: symbol, score.
+    """
+    q = finnhub_quote(symbol)
+    if not q or q.get("c") is None:
+        return None
+
+    price = float(q.get("c", 0) or 0)
+    chg = float(q.get("d", 0) or 0)
+    chg_pct = float(q.get("dp", 0) or 0)
+    prev_close = float(q.get("pc", 0) or 0)
+
+    # Example "oversold-ish" score: reward down days, penalize big green days.
+    # Replace with your RSI/ATR/divergence/catalyst gates.
+    score = 0.0
+    if chg < 0:
+        score += min(abs(chg), 10.0)
+    if chg_pct < 0:
+        score += min(abs(chg_pct), 10.0) / 2.0
+
+    # Simple gate example: must be liquid-ish and not penny stock
+    if price < 5:
+        return None
+
+    return {
+        "symbol": symbol,
+        "score": float(score),
+        "price": price,
+        "chg": chg,
+        "chg_pct": chg_pct,
+        "prev_close": prev_close,
+        "ts_utc": datetime.utcnow().isoformat()
+    }
+
+
+def run_scan():
+    universe = load_universe(UNIVERSE_CSV, vendor=VENDOR)
+    print(f"Loaded {len(universe)} symbols from {UNIVERSE_CSV} (vendor={VENDOR})")
+
+    results = []
+    for batch_idx, batch in enumerate(chunked(universe, BATCH_SIZE), start=1):
+        print(f"Batch {batch_idx}: {len(batch)} symbols")
+
+        for sym in batch:
+            row = scan_symbol(sym)
+            if row:
+                results.append(row)
+
+        # throttle between batches
+        time.sleep(SLEEP_SECONDS)
+
+    if not results:
+        raise RuntimeError("No results produced. Check API key, endpoints, and rate limits.")
+
+    df = pd.DataFrame(results).sort_values("score", ascending=False).head(25)
+
+    df.to_csv(TOP25_CSV, index=False)
+    TOP25_JSON.write_text(json.dumps(df.to_dict(orient="records"), indent=2))
+
+    print(f"Wrote {len(df)} rows -> {TOP25_CSV}")
+    return df
+
+
+# -----------------------------
+# Email sender (optional)
+# -----------------------------
+def send_email_with_attachment(subject: str, body: str, attachment_path: Path):
+    if not (SMTP_USER and SMTP_PASS and EMAIL_TO):
+        print("Email not configured (SMTP_USER/SMTP_PASS/EMAIL_TO missing). Skipping email.")
+        return
+
+    msg = MIMEMultipart()
+    msg["From"] = SMTP_USER
+    msg["To"] = EMAIL_TO
+    msg["Subject"] = subject
+
+    msg.attach(MIMEText(body, "plain"))
+
+    with open(attachment_path, "rb") as f:
+        part = MIMEApplication(f.read(), Name=attachment_path.name)
+        part["Content-Disposition"] = f'attachment; filename="{attachment_path.name}"'
+        msg.attach(part)
+
+    with smtplib.SMTP(SMTP_HOST, SMTP_PORT) as server:
+        server.starttls()
+        server.login(SMTP_USER, SMTP_PASS)
+        server.sendmail(SMTP_USER, [EMAIL_TO], msg.as_string())
+
+    print(f"Email sent to {EMAIL_TO} with attachment {attachment_path.name}")
+
+
+def main():
+    eastern = pytz.timezone("US/Eastern")
+    now_et = datetime.now(eastern).strftime("%Y-%m-%d %H:%M %Z")
+
+    df = run_scan()
+
+    subject = f"Top 25 Scanner Results (S&P 500) - {now_et}"
+    body = (
+        f"Attached: {TOP25_CSV.name}\n"
+        f"Rows: {len(df)}\n\n"
+        f"Top 10 preview:\n{df.head(10).to_string(index=False)}\n"
+    )
+
+    send_email_with_attachment(subject, body, TOP25_CSV)
+
+
+if name == "main":
+    main()
 """
 runner.py — Consolidated Next-Day Stock Scanner (Oversold + Momentum) for GitHub Actions
 
