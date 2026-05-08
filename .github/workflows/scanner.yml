@@ -1,0 +1,65 @@
+name: Next-Day Stock Scanner
+
+on:
+  schedule:
+    # 12:30 UTC (8:30 AM EDT, covers most of DST period)
+    - cron: '30 12 * * 1-5'
+    # 13:30 UTC (8:30 AM EST, covers winter)
+    - cron: '30 13 * * 1-5'
+  workflow_dispatch:
+
+jobs:
+  scan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy requests python-dateutil
+
+      - name: Run scanner
+        env:
+          FINNHUB_API_KEY: ${{ secrets.FINNHUB_API_KEY }}
+          SMTP_HOST: smtp-mail.outlook.com
+          SMTP_PORT: 587
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASS: ${{ secrets.SMTP_PASS }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          RUN_TZ: America/New_York
+          RUN_HHMM: 0830
+          RUN_WINDOW_MINUTES: 10
+          TOP_N: 25
+          TOP_OVERSOLD: 10
+          TOP_MOMENTUM: 10
+          MAX_PER_SECTOR: 5
+          EXCLUDE_HEALTHCARE: 1
+          EXCLUDE_CHINA_ADR: 1
+        run: python runner.py
+
+      - name: Upload scan results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: scan-results
+          path: .cache/*.csv
+          retention-days: 30
+
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v3
+        with:
+          name: workflow-logs
+          path: ${{ github.workspace }}
+          retention-days: 7
